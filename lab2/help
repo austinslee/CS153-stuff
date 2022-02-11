@@ -1,0 +1,262 @@
+diff --git a/Makefile b/Makefile
+index 09d790c..0ca952e 100644
+--- a/Makefile
++++ b/Makefile
+@@ -181,6 +181,7 @@ UPROGS=\
+ 	_usertests\
+ 	_wc\
+ 	_zombie\
++	_test2\
+ 
+ fs.img: mkfs README $(UPROGS)
+ 	./mkfs fs.img README $(UPROGS)
+diff --git a/defs.h b/defs.h
+index 82fb982..9c12c31 100644
+--- a/defs.h
++++ b/defs.h
+@@ -120,6 +120,7 @@ void            userinit(void);
+ int             wait(void);
+ void            wakeup(void*);
+ void            yield(void);
++int		set_prior(int);
+ 
+ // swtch.S
+ void            swtch(struct context**, struct context*);
+diff --git a/exec.c b/exec.c
+index b40134f..fad01f3 100644
+--- a/exec.c
++++ b/exec.c
+@@ -93,6 +93,10 @@ exec(char *path, char **argv)
+       last = s+1;
+   safestrcpy(curproc->name, last, sizeof(curproc->name));
+ 
++	curproc->T_start = ticks;
++	curproc->burst_time = 0;
++
++
+   // Commit to the user image.
+   oldpgdir = curproc->pgdir;
+   curproc->pgdir = pgdir;
+diff --git a/proc.c b/proc.c
+index 806b1b1..6534ad0 100644
+--- a/proc.c
++++ b/proc.c
+@@ -89,6 +89,7 @@ found:
+   p->state = EMBRYO;
+   p->pid = nextpid++;
+ 
++
+   release(&ptable.lock);
+ 
+   // Allocate kernel stack.
+@@ -112,6 +113,9 @@ found:
+   memset(p->context, 0, sizeof *p->context);
+   p->context->eip = (uint)forkret;
+ 
++  p->prior_val = 15; 
++  
++
+   return p;
+ }
+ 
+@@ -198,6 +202,7 @@ fork(void)
+   }
+   np->sz = curproc->sz;
+   np->parent = curproc;
++  np->prior_val = curproc->prior_val;
+   *np->tf = *curproc->tf;
+ 
+   // Clear %eax so that fork returns 0 in the child.
+@@ -230,6 +235,7 @@ exit(void)
+   struct proc *curproc = myproc();
+   struct proc *p;
+   int fd;
++  int T_end;
+ 
+   if(curproc == initproc)
+     panic("init exiting");
+@@ -247,6 +253,9 @@ exit(void)
+   end_op();
+   curproc->cwd = 0;
+ 
++  T_end = ticks;
++  cprintf("\n Turnaround time is %d\n", T_end - curproc->T_start);
++
+   acquire(&ptable.lock);
+ 
+   // Parent might be sleeping in wait().
+@@ -324,17 +333,32 @@ scheduler(void)
+ {
+   struct proc *p;
+   struct cpu *c = mycpu();
++  struct proc *xd;
+   c->proc = 0;
+   
+   for(;;){
+     // Enable interrupts on this processor.
+     sti();
+ 
+-    // Loop over process table looking for process to run.
++
++
++    // Loop over process table looking for lowest priority
++
++	while(p < &ptable.proc[NPROC]) {
++		if(p->state != RUNNABLE) {
++			p++;
++			continue;
++		}
++	}
+     acquire(&ptable.lock);
+-    for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
+-      if(p->state != RUNNABLE)
+-        continue;
++    for(xd = p + 1; xd < &ptable.proc[NPROC]; xd++){
++	if(xd->state == RUNNABLE && p->prior_val > xd->prior_val) {
++		p = xd;
++	}	
++    }
++	
++
++	
+ 
+       // Switch to chosen process.  It is the process's job
+       // to release ptable.lock and then reacquire it
+@@ -342,6 +366,7 @@ scheduler(void)
+       c->proc = p;
+       switchuvm(p);
+       p->state = RUNNING;
++	p->burst_time++;
+ 
+       swtch(&(c->scheduler), p->context);
+       switchkvm();
+@@ -349,9 +374,27 @@ scheduler(void)
+       // Process is done running for now.
+       // It should have changed its p->state before coming back.
+       c->proc = 0;
+-    }
+-    release(&ptable.lock);
+ 
++	//aging of priority implementation
++	//goes through table and compares runnable process to xd(the process that just executed)
++	//if xd and p are the same we decrease the priorirty by increasing prior_val of that processs
++	//if xd and p are not the same we increase the priority by decreasing prior_val of that process
++	for(p = ptable.proc; p < &ptable.proc[NPROC]; p++) {
++		if(p->state != RUNNABLE) {
++			continue;
++		}
++		if(p == xd) {
++			if(p->prior_val < 31) {
++				p->prior_val++;
++			}
++		}
++		if(p != xd) {
++			if(p->prior_val > 0) {
++				p->prior_val--;
++			}
++		}
++	}
++    release(&ptable.lock);
+   }
+ }
+ 
+@@ -532,3 +575,18 @@ procdump(void)
+     cprintf("\n");
+   }
+ }
++
++int
++set_prior(int prior_lvl) {
++	struct proc *p = myproc();
++	if(prior_lvl > 31) {
++		prior_lvl = 31;
++	}
++	else if(prior_lvl < 0) {
++		prior_lvl = 0;
++	}
++	p->prior_val = prior_lvl;
++	yield();
++	return -1;
++}
++		
+diff --git a/proc.h b/proc.h
+index 1647114..310302b 100644
+--- a/proc.h
++++ b/proc.h
+@@ -49,6 +49,9 @@ struct proc {
+   struct file *ofile[NOFILE];  // Open files
+   struct inode *cwd;           // Current directory
+   char name[16];               // Process name (debugging)
++  int prior_val;	       // from 0-31, 31 being lowest prio, 0 being highest prio. initial value will be 15
++  int T_start;		       // Time start for process
++  int burst_time;	       //wtf
+ };
+ 
+ // Process memory is laid out contiguously, low addresses first:
+diff --git a/syscall.c b/syscall.c
+index ee85261..5e3aeb0 100644
+--- a/syscall.c
++++ b/syscall.c
+@@ -103,6 +103,7 @@ extern int sys_unlink(void);
+ extern int sys_wait(void);
+ extern int sys_write(void);
+ extern int sys_uptime(void);
++extern int sys_set_prior(void);
+ 
+ static int (*syscalls[])(void) = {
+ [SYS_fork]    sys_fork,
+@@ -126,6 +127,7 @@ static int (*syscalls[])(void) = {
+ [SYS_link]    sys_link,
+ [SYS_mkdir]   sys_mkdir,
+ [SYS_close]   sys_close,
++[SYS_set_prior] sys_set_prior,
+ };
+ 
+ void
+diff --git a/syscall.h b/syscall.h
+index bc5f356..7913d06 100644
+--- a/syscall.h
++++ b/syscall.h
+@@ -20,3 +20,4 @@
+ #define SYS_link   19
+ #define SYS_mkdir  20
+ #define SYS_close  21
++#define SYS_set_prior 22
+diff --git a/sysproc.c b/sysproc.c
+index 0686d29..7bd75d4 100644
+--- a/sysproc.c
++++ b/sysproc.c
+@@ -89,3 +89,12 @@ sys_uptime(void)
+   release(&tickslock);
+   return xticks;
+ }
++
++int
++sys_set_prior(void) {
++	int prior;
++	if (argint(0, &prior) < 0) {
++		return -1;
++	}
++	return set_prior(prior);
++}
+diff --git a/user.h b/user.h
+index 4f99c52..fc39578 100644
+--- a/user.h
++++ b/user.h
+@@ -23,6 +23,7 @@ int getpid(void);
+ char* sbrk(int);
+ int sleep(int);
+ int uptime(void);
++int set_prior(int prior_lvl);
+ 
+ // ulib.c
+ int stat(const char*, struct stat*);
+diff --git a/usys.S b/usys.S
+index 8bfd8a1..4a4e709 100644
+--- a/usys.S
++++ b/usys.S
+@@ -29,3 +29,4 @@ SYSCALL(getpid)
+ SYSCALL(sbrk)
+ SYSCALL(sleep)
+ SYSCALL(uptime)
++SYSCALL(set_prior)
